@@ -28,33 +28,66 @@ app.config['ALLOWED_EXTENSIONS'] = {'png', 'jpg', 'jpeg', 'pdf'}
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 logging.basicConfig(level=logging.INFO)
 
-# --- Azure Clients (remains the same) ---
 document_intelligence_client = DocumentIntelligenceClient(
     endpoint=AZURE_ENDPOINT, credential=AzureKeyCredential(AZURE_KEY)
 )
 
-# --- Helper Functions (remains the same) ---
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
 
+# --- MODIFIED SECTION: Enhanced safe_val function ---
 def safe_val(v):
-    if v is None: return None
-    if hasattr(v, "value_address") and v.value_address is not None:
+    """
+    Recursively and safely extracts and formats values from Azure's response objects,
+    handling simple and complex nested types.
+    """
+    if v is None:
+        return None
+
+    # Check for specific value types first and extract the readable value
+    if hasattr(v, "value_address") and v.value_address:
         addr = v.value_address
         parts = [getattr(addr, f) for f in ["house_number", "road", "city", "state", "postal_code", "country_region"] if getattr(addr, f, None)]
         return ", ".join(parts)
-    if hasattr(v, "value_currency") and v.value_currency is not None:
+    
+    if hasattr(v, "value_currency") and v.value_currency:
         cur = v.value_currency
         amount = getattr(cur, "amount", None)
-        symbol = getattr(cur, "symbol", "")
+        symbol = getattr(cur, "symbol", "") or getattr(cur, "currency_code", "")
         return f"{symbol}{amount}" if amount is not None else symbol
-    for attr in ["value_string", "value_number", "value_date", "value"]:
+
+    if hasattr(v, "value_phone_number") and v.value_phone_number:
+        return v.value_phone_number
+
+    if hasattr(v, "value_array") and v.value_array:
+        # Recursively process each item in the array and join them into a readable string
+        return ", ".join([safe_val(item) for item in v.value_array])
+
+    if hasattr(v, "value_object") and v.value_object:
+        # Recursively process each key-value pair in the object
+        parts = []
+        for key, value in v.value_object.items():
+            formatted_value = safe_val(value)
+            if formatted_value:  # Only include if there is a value
+                parts.append(f"{key}: {formatted_value}")
+        return "; ".join(parts)
+
+    # Fallback for simple types
+    for attr in ["value_string", "value_number", "value_date"]:
         if hasattr(v, attr):
             val = getattr(v, attr)
-            if val is not None: return str(val)
-    return str(v)
+            if val is not None:
+                return str(val)
 
-# --- Routes ---
+    # If no specific value_... attribute is found, use the raw content
+    if hasattr(v, "content"):
+        return v.content
+    
+    # Final fallback if the object is something else entirely
+    return str(v)
+# --- END OF MODIFIED SECTION ---
+
+
 @app.route('/', methods=['GET', 'POST'])
 def upload_invoice():
     if request.method == 'POST':
@@ -74,53 +107,36 @@ def upload_invoice():
             try:
                 file.save(filepath)
                 
-                # 1. Analyze with Document Intelligence
                 with open(filepath, "rb") as f:
                     poller = document_intelligence_client.begin_analyze_document("prebuilt-invoice", f)
                     result = poller.result()
                 
-                invoice_data = {}
+                all_fields = {}
+                line_items = []
                 if result.documents:
-                    # *** THIS IS THE LOGIC THAT WAS MISSING AND IS NOW RESTORED ***
                     doc = result.documents[0]
-                    fields = doc.fields
-                    invoice_data['InvoiceId'] = safe_val(fields.get("InvoiceId"))
-                    invoice_data['InvoiceDate'] = safe_val(fields.get("InvoiceDate"))
-                    invoice_data['PurchaseOrder'] = safe_val(fields.get("PurchaseOrder"))
-                    invoice_data['VendorName'] = safe_val(fields.get("VendorName"))
-                    invoice_data['CustomerName'] = safe_val(fields.get("CustomerName"))
-                    invoice_data['BillingAddress'] = safe_val(fields.get("BillingAddress"))
-                    invoice_data['ShippingAddress'] = safe_val(fields.get("ShippingAddress"))
-                    invoice_data['SubTotal'] = safe_val(fields.get("SubTotal"))
-                    invoice_data['TotalTax'] = safe_val(fields.get("TotalTax"))
-                    invoice_data['AmountDue'] = safe_val(fields.get("AmountDue"))
-
-                    items = []
-                    if fields.get("Items"):
-                        for item in fields.get("Items").value_array:
-                            item_fields = item.value_object
-                            item_val = lambda key: safe_val(item_fields.get(key))
-                            items.append({
-                                "Description": item_val("Description"), "Quantity": item_val("Quantity"),
-                                "Unit": item_val("Unit"), "UnitPrice": item_val("UnitPrice"),
-                                "ProductCode": item_val("ProductCode"), "Tax": item_val("Tax"),
-                                "Amount": item_val("Amount"),
-                            })
-                    invoice_data['Items'] = items
-                    # *** END OF RESTORED LOGIC ***
+                    for key, field in doc.fields.items():
+                        if key == "Items":
+                            if field.value_array:
+                                for item in field.value_array:
+                                    item_fields = item.value_object
+                                    item_val = lambda k: safe_val(item_fields.get(k))
+                                    line_items.append({
+                                        "Description": item_val("Description"), "Quantity": item_val("Quantity"),
+                                        "Unit": item_val("Unit"), "UnitPrice": item_val("UnitPrice"),
+                                        "ProductCode": item_val("ProductCode"), "Tax": item_val("Tax"),
+                                        "Amount": item_val("Amount"),
+                                    })
+                        else:
+                            all_fields[key] = safe_val(field)
                 else:
                     flash("No documents were found in the provided file.")
                     if os.path.exists(filepath): os.remove(filepath)
                     return redirect(url_for('upload_invoice'))
 
-                # 2. Upload to Azure File Share
                 try:
                     logging.info(f"Uploading '{unique_filename}' to Azure File Share '{AZURE_SHARE_NAME}'...")
-                    file_client = ShareFileClient.from_connection_string(
-                        conn_str=AZURE_STORAGE_CONNECTION_STRING,
-                        share_name=AZURE_SHARE_NAME,
-                        file_path=unique_filename
-                    )
+                    file_client = ShareFileClient.from_connection_string(conn_str=AZURE_STORAGE_CONNECTION_STRING, share_name=AZURE_SHARE_NAME, file_path=unique_filename)
                     with open(filepath, "rb") as source_file:
                         file_client.upload_file(source_file)
                     logging.info("Upload to Azure File Share successful.")
@@ -128,15 +144,16 @@ def upload_invoice():
                     logging.error(f"Failed to upload file to Azure File Share: {e}")
                     flash("Invoice was parsed, but failed to archive. Please contact support.")
 
-                # 3. Render the result
-                result_json = invoice_data
+                result_json = all_fields.copy()
+                result_json["Items"] = line_items
                 static_file = f"uploads/{unique_filename}"
                 return render_template(
                     'result.html',
-                    invoice_data=invoice_data,
+                    invoice_fields=all_fields,
+                    line_items=line_items,
                     static_file=static_file,
                     orig_filename=filename,
-                    result_json=json.dumps(result_json, indent=2)
+                    result_json=json.dumps(result_json, indent=2, default=str)
                 )
             except Exception as e:
                 logging.error(f"An unexpected error occurred during processing: {e}")
