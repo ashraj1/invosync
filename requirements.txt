@@ -1,3 +1,6 @@
 flask
 azure-ai-documentintelligence
 werkzeug
+gunicorn
+waitress
+azure-storage-file-share
