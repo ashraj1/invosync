@@ -1,6 +1,10 @@
 flask
-azure-ai-documentintelligence
 werkzeug
-gunicorn
 waitress
+# For Azure
+azure-ai-documentintelligence
 azure-storage-file-share
+# For OpenAI
+openai
+PyMuPDF
+Pillow
